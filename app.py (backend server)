@@ -1,0 +1,253 @@
+from flask import Flask, jsonify, request
+from datetime import datetime
+
+import sqlite3
+
+def init_db():
+    with sqlite3.connect("database.db") as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                balance INTEGER NOT NULL
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender_id INTEGER,
+                receiver_id INTEGER,
+                sender_name TEXT,
+                receiver_name TEXT,
+                amount INTEGER,
+                timestamp TEXT
+            )
+        """)
+        
+app = Flask(__name__)
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    return jsonify({
+        "error": str(e)
+    }), 500
+
+def get_db_connection():
+    conn = sqlite3.connect("database.db")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+@app.route('/')
+def home():
+    return "Mini Payment System API is running!"
+
+# GET all users
+@app.route('/users', methods=['GET'])
+def get_users():
+    conn = get_db_connection()
+    users = conn.execute("SELECT * FROM users").fetchall()
+    conn.close()
+
+    return jsonify([dict(u) for u in users])
+
+# ADD user
+@app.route('/add_user', methods=['POST'])
+def add_user():
+    data = request.get_json()
+
+    name = data["name"]
+    balance = data.get("balance", 0)
+
+    # validation
+    if not name:
+        return {"error": "name is required"}, 400
+
+    if balance < 0:
+        return {"error": "balance cannot be negative"}, 400
+
+    conn = get_db_connection()
+
+    # check if user already exists
+    existing_user = conn.execute(
+        "SELECT * FROM users WHERE name = ?",
+        (name,)
+    ).fetchone()
+
+    if existing_user:
+        conn.close()
+        return {"error": "user already exists"}, 409
+
+    # create user
+    conn.execute(
+        "INSERT INTO users (name, balance) VALUES (?, ?)",
+        (name, balance)
+    )
+    conn.commit()
+    conn.close()
+
+    return {"message": "user added"}
+
+def resolve_user(conn, user_id=None, user_name=None):
+    if user_id is not None:
+        return conn.execute(
+            "SELECT * FROM users WHERE id = ?",
+            (user_id,)
+        ).fetchone()
+
+    if user_name is not None:
+        return conn.execute(
+            "SELECT * FROM users WHERE name = ?",
+            (user_name,)
+        ).fetchone()
+
+    return None
+
+@app.route('/send_money', methods=['POST'])
+def send_money():
+    data = request.get_json()
+
+    if not data:
+        return {"error": "invalid JSON body"}, 400
+    
+
+    sender_input = data.get("from")
+    receiver_input = data.get("to")
+    amount = data.get("amount")
+
+    if amount is None or amount <= 0:
+        return {"error": "invalid amount"}, 400
+
+    if not sender_input or not receiver_input:
+        return {"error": "sender and receiver required"}, 400
+
+
+    conn = get_db_connection()
+    conn.isolation_level = None
+    conn.execute("BEGIN")
+
+    try:
+        conn.execute("BEGIN")
+
+        # determine sender
+        if isinstance(sender_input, int):
+            sender = conn.execute(
+                "SELECT * FROM users WHERE id = ?",
+                (sender_input,)
+            ).fetchone()
+        else:
+            sender = conn.execute(
+                "SELECT * FROM users WHERE name = ?",
+                (sender_input,)
+            ).fetchone()
+
+        # determine receiver
+        if isinstance(receiver_input, int):
+            receiver = conn.execute(
+                "SELECT * FROM users WHERE id = ?",
+                (receiver_input,)
+            ).fetchone()
+        else:
+            receiver = conn.execute(
+                "SELECT * FROM users WHERE name = ?",
+                (receiver_input,)
+            ).fetchone()
+
+        # validations
+        if not sender or not receiver:
+            raise Exception("sender or receiver not found")
+
+        if sender["balance"] < amount:
+            raise Exception("insufficient funds")
+
+        # update balances
+        conn.execute(
+            "UPDATE users SET balance = balance - ? WHERE id = ?",
+            (amount, sender["id"])
+        )
+
+        conn.execute(
+            "UPDATE users SET balance = balance + ? WHERE id = ?",
+            (amount, receiver["id"])
+        )
+
+        # insert transaction
+        conn.execute(
+            """
+            INSERT INTO transactions
+            (sender_id, receiver_id, sender_name, receiver_name, amount, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                sender["id"],
+                receiver["id"],
+                sender["name"],
+                receiver["name"],
+                amount,
+                datetime.now().isoformat()
+            )
+        )
+
+        conn.execute("COMMIT")
+
+        updated_sender = conn.execute(
+            "SELECT * FROM users WHERE id = ?",
+            (sender["id"],)
+        ).fetchone()
+
+        updated_receiver = conn.execute(
+            "SELECT * FROM users WHERE id = ?",
+            (receiver["id"],)
+        ).fetchone()
+
+        return {
+            "message": "transfer successful",
+            "from": dict(updated_sender),
+            "to": dict(updated_receiver)
+        }
+
+    except Exception as e:
+        conn.execute("ROLLBACK")
+        return {"error": "transfer failed", "details": str(e)}, 500
+
+    finally:
+        conn.close()
+
+@app.route('/transactions', methods=['GET'])
+def get_transactions():
+    user = request.args.get("user")        # name
+    user_id = request.args.get("user_id")  # id
+
+    conn = get_db_connection()
+
+    if user_id:
+        transactions = conn.execute(
+            """
+            SELECT * FROM transactions
+            WHERE sender_id = ? OR receiver_id = ?
+            """,
+            (user_id, user_id)
+        ).fetchall()
+
+    elif user:
+        transactions = conn.execute(
+            """
+            SELECT * FROM transactions
+            WHERE sender_name = ? OR receiver_name = ?
+            """,
+            (user, user)
+        ).fetchall()
+
+    else:
+        transactions = conn.execute(
+            "SELECT * FROM transactions"
+        ).fetchall()
+
+    conn.close()
+
+    return jsonify([dict(t) for t in transactions])
+
+if __name__ == "__main__":
+    init_db()
+    app.run()
